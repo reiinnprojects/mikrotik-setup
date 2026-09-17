@@ -54,3 +54,8 @@ Serial **HJC0A5MY028** is refused unless `mikrotiksetup restore --force` / `mikr
 | `mikrotiksetup bootstrap` | `docker:bootstrap-mikrotik` |
 
 Bash helpers stay in the portal repo until this CLI is proven on hardware.
+
+## Repository
+
+<https://github.com/reiinnprojects/mikrotik-setup>
+
