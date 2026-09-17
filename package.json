@@ -1,7 +1,7 @@
 {
   "name": "mikrotiksetup",
   "version": "1.0.0",
-  "description": "Interactive MikroTik onboarder for LokalFi (gold restore, flash upload, device-mode)",
+  "description": "Set up a LokalFi MikroTik from a terminal",
   "main": "bin/mikrotiksetup.js",
   "bin": {
     "mikrotiksetup": "./bin/mikrotiksetup.js"

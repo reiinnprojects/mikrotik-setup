@@ -1,10 +1,6 @@
 #!/usr/bin/env node
 
-/**
- * mikrotiksetup — onboard a LokalFi MikroTik from the NUC terminal.
- * Runs bash helpers in this repo (scripts/). Portal checkout is only for
- * flash HTML, docker/.env, and docker:bootstrap-mikrotik.
- */
+/** mikrotiksetup — set up a LokalFi MikroTik from a terminal. */
 
 const { spawnSync } = require('child_process');
 const fs = require('fs');
@@ -72,7 +68,7 @@ function goldFile(model) {
   const name = model === 'E50UG' ? 'E50UG-config.backup' : 'RB750Gr3-config.backup';
   const f = path.join(GOLD_DIR, name);
   if (!fs.existsSync(f)) {
-    err(`Gold backup missing: ${f}`);
+    err(`Backup file missing: ${f}`);
     process.exit(1);
   }
   return f;
@@ -106,13 +102,13 @@ function warnEnvMismatch(root) {
   const user = env.MIKROTIK_USER || env.NEXT_PUBLIC_MIKROTIK_USER || 'admin';
   const pass = env.MIKROTIK_PASSWORD || env.NEXT_PUBLIC_MIKROTIK_PASSWORD;
   if (ip && ip !== GOLD_LAN) {
-    warn(`deployment/docker/.env management IP is ${ip}, gold LAN is ${GOLD_LAN}.`);
+    warn(`deployment/docker/.env management IP is ${ip}; after restore the router is ${GOLD_LAN}.`);
   }
   if (pass && pass !== GOLD_CREDS.password) {
-    warn('deployment/docker/.env MikroTik password is not lokalfi.net. App API may miss this router.');
+    warn('deployment/docker/.env MikroTik password is not lokalfi.net. The app API may miss this router.');
   }
   if (user && user !== GOLD_CREDS.user) {
-    warn(`deployment/docker/.env MikroTik user is ${user}, gold is admin.`);
+    warn(`deployment/docker/.env MikroTik user is ${user}; after restore it is admin.`);
   }
 }
 
@@ -160,7 +156,7 @@ const TOOL_SCRIPTS = {
   wan: 'mikrotik-fix-wan-internet.sh',
   parity: 'mikrotik-router-parity-fix.sh',
   deviceMode: 'mikrotik-enable-hotspot-device-mode.sh',
-  garden: 'mikrotik-apply-portal-network.sh',
+  portalNetwork: 'mikrotik-apply-portal-network.sh',
   pull: 'mikrotik-pull-backup.sh',
 };
 
@@ -209,12 +205,12 @@ function mikrotikEnv(sess, extra = {}) {
 }
 
 function printHelp() {
-  console.log(`mikrotiksetup — LokalFi MikroTik onboarder
+  console.log(`mikrotiksetup — set up a LokalFi MikroTik from a terminal
 
 Usage:
-  mikrotiksetup                 interactive menu (Enter = everything)
-  mikrotiksetup setup           full 09-17 gold onboard
-  mikrotiksetup setup --skip-restore   continue from device-mode (no gold load)
+  mikrotiksetup                 menu (Enter = full setup)
+  mikrotiksetup setup           full setup
+  mikrotiksetup setup --skip-restore   skip restore; continue from device-mode
   mikrotiksetup config          set path to lokalfi-captive-portal
   mikrotiksetup upload-hotspot
   mikrotiksetup wan
@@ -225,12 +221,12 @@ Usage:
   mikrotiksetup format-sd
   mikrotiksetup bootstrap
 
-Factory routers listen on 192.168.88.1. A NUC that is only 192.168.10.220 cannot reach that
-until you are on the same LAN (or add 192.168.88.x yourself). After restore: 192.168.10.1
-on ether2-LAN, admin / lokalfi.net. Device-mode still needs a short reset tap on the box.
+A new router is often 192.168.88.1. This PC must already be on that subnet, or you add 192.168.88.x yourself.
+After restore: 192.168.10.1 on ether2-LAN, admin / lokalfi.net. Device-mode still needs a short reset tap on the box.
 
-Gold backups are 09-17 (July voucher set). Lab serial ${LAB_SERIAL} is blocked unless --force.
-Helpers live in this repo under scripts/. Portal path is only flash HTML + .env + Mongo bootstrap.
+Restore loads the 17 Sep 2026 backup for this model (July voucher set, not a blank router).
+Lab serial ${LAB_SERIAL} is blocked unless --force.
+scripts/ talks to the router. The portal checkout supplies hotspot HTML, docker/.env, and Mongo.
 `);
 }
 
@@ -257,7 +253,7 @@ async function probeSession(rl) {
     }
   }
   warn('admin / lokalfi.net failed. Treat as a new router. Sticker user/password next.');
-  warn('If the IP is 192.168.88.1, this NUC must already be on that subnet.');
+  warn('If the IP is 192.168.88.1, this PC must already be on that subnet.');
   const user = await prompt(rl, 'SSH user', 'admin');
   const password = await prompt(rl, 'SSH password (sticker)', '');
   if (!password) {
@@ -272,7 +268,7 @@ async function probeSession(rl) {
   info('Setting admin password to lokalfi.net (RouterOS often requires a change after first login).');
   const setPw = sshOk(host, user, password, '/user set [find name=admin] password="lokalfi.net"');
   if (setPw === null) {
-    warn('Could not set admin password. Restore may still apply gold credentials.');
+    warn('Could not set admin password. Restore may still set admin / lokalfi.net.');
     return { host, user, password, rb: parseRouterboard(out), factory: true };
   }
   const again = sshOk(host, GOLD_CREDS.user, GOLD_CREDS.password, '/system routerboard print');
@@ -312,6 +308,14 @@ function runBootstrap(root) {
   return r.status || 0;
 }
 
+function uploadHotspot(host, extraEnv, disk) {
+  if (runTool(TOOL_SCRIPTS.upload, [host], { ...extraEnv, MIKROTIK_ROUTER_FILES_DISK: disk }) !== 0) {
+    warn('Upload failed. Retry: mikrotiksetup upload-hotspot');
+    return false;
+  }
+  return true;
+}
+
 async function resolveRb750Slot(rl, host, extraEnv) {
   for (;;) {
     const probe = probeFormatSlots(host, extraEnv);
@@ -320,13 +324,18 @@ async function resolveRb750Slot(rl, host, extraEnv) {
       return probe.slots[0];
     }
     if (probe.slots.length === 0) {
+      if (!process.stdin.isTTY) {
+        warn('No SD card. Using internal flash.');
+        return null;
+      }
       const a = await prompt(
         rl,
-        'No mounted SD card. Insert one and press Enter to retry (or type skip)',
+        'No SD card. Press Enter to use flash, or type retry after inserting a card',
         ''
       );
-      if (a.toLowerCase() === 'skip') return null;
-      continue;
+      if (a.toLowerCase() === 'retry') continue;
+      warn('Using internal flash.');
+      return null;
     }
     info('More than one mounted removable disk:');
     probe.slots.forEach((s) => console.log(`  ${s}`));
@@ -372,7 +381,7 @@ async function cmdSetup(rl, { forceRestore = false, skipRestore = false } = {}) 
     };
     const rbOut = sshOk(after.host, after.user, after.password, '/system routerboard print');
     if (!rbOut) {
-      err(`No SSH on ${GOLD_LAN} after restore. Plug the NUC into ether2-LAN on 192.168.10.0/24.`);
+      err(`No SSH on ${GOLD_LAN} after restore. Plug this PC into ether2-LAN on 192.168.10.0/24.`);
       process.exit(1);
     }
     after.rb = parseRouterboard(rbOut);
@@ -390,31 +399,27 @@ async function cmdSetup(rl, { forceRestore = false, skipRestore = false } = {}) 
   const afterEnv = mikrotikEnv(after);
   if (afterModel === 'RB750Gr3') {
     if (runTool(TOOL_SCRIPTS.wan, [after.host], afterEnv) !== 0) {
-      warn('WAN parity returned non-zero. Continuing.');
+      warn('WAN fix returned non-zero. Continuing.');
     }
     const slot = await resolveRb750Slot(rl, after.host, afterEnv);
     if (!slot) {
-      warn('Skipped SD format/upload. Insert a card later: mikrotiksetup format-sd then mikrotiksetup upload-hotspot');
+      uploadHotspot(after.host, afterEnv, 'flash');
     } else {
-        const fmtRc = runTool(TOOL_SCRIPTS.formatSd, ['--yes', '--slot', slot, after.host], afterEnv);
-        if (fmtRc !== 0) {
-          warn('SD did not mount after format (card may have I/O errors). Uploading hotspot to internal flash so the portal still works.');
-          if (runTool(TOOL_SCRIPTS.upload, [after.host], { ...afterEnv, MIKROTIK_ROUTER_FILES_DISK: 'flash' }) !== 0) {
-            warn('Upload failed. Retry: mikrotiksetup upload-hotspot');
-          }
-        } else {
-          const uploadDisk = /-part[0-9]+$/i.test(slot) ? slot : `${slot}-part1`;
-          if (runTool(TOOL_SCRIPTS.upload, [after.host], { ...afterEnv, MIKROTIK_ROUTER_FILES_DISK: uploadDisk }) !== 0) {
-            warn('Upload to SD failed. Retry: mikrotiksetup upload-hotspot');
-          }
-        }
+      const fmtRc = runTool(TOOL_SCRIPTS.formatSd, ['--yes', '--slot', slot, after.host], afterEnv);
+      if (fmtRc !== 0) {
+        warn('SD did not mount after format. Uploading hotspot to internal flash.');
+        uploadHotspot(after.host, afterEnv, 'flash');
+      } else {
+        const uploadDisk = /-part[0-9]+$/i.test(slot) ? slot : `${slot}-part1`;
+        uploadHotspot(after.host, afterEnv, uploadDisk);
+      }
     }
-  } else if (runTool(TOOL_SCRIPTS.upload, [after.host], { ...afterEnv, MIKROTIK_ROUTER_FILES_DISK: 'flash' }) !== 0) {
-    warn('Upload failed. Retry: mikrotiksetup upload-hotspot');
+  } else {
+    uploadHotspot(after.host, afterEnv, 'flash');
   }
 
   const lan = nucLanIp(root);
-  if (runTool(TOOL_SCRIPTS.garden, [after.host], { ...afterEnv, NUC_LAN_IP: lan }) !== 0) {
+  if (runTool(TOOL_SCRIPTS.portalNetwork, [after.host], { ...afterEnv, NUC_LAN_IP: lan }) !== 0) {
     warn('Portal network failed. Retry: mikrotiksetup apply-portal-network');
   }
 
@@ -435,7 +440,7 @@ async function cmdFormat(rl) {
   process.exit(runTool(TOOL_SCRIPTS.formatSd, [sess.host], mikrotikEnv(sess)));
 }
 
-async function wrap(scriptFile, extra = [], extraEnv = {}) {
+function wrap(scriptFile, extra = [], extraEnv = {}) {
   const host = process.env.MIKROTIK_HOST || GOLD_LAN;
   const env = {
     MIKROTIK_HOST: host,
@@ -449,34 +454,34 @@ async function wrap(scriptFile, extra = [], extraEnv = {}) {
 async function menu(rl) {
   console.log('');
   info('What do you want to run?');
-  console.log('  1) Everything (09-17 gold onboard)');
-  console.log('  2) Upload hotspot');
-  console.log('  3) Router WAN / parity');
+  console.log('  1) Full setup');
+  console.log('  2) Upload hotspot files');
+  console.log('  3) Fix WAN / internet');
   console.log('  4) Enable hotspot device-mode');
-  console.log('  5) Apply portal network');
-  console.log('  6) Pull backup (lab dump)');
-  console.log('  7) Restore 09-17 gold');
-  console.log('  8) Format SD (exFAT, RB750)');
-  console.log('  9) Bootstrap app MikroTik config');
+  console.log('  5) Point the hotspot at the app');
+  console.log('  6) Save a backup from this router');
+  console.log('  7) Restore the 17 Sep backup');
+  console.log('  8) Format SD card (RB750)');
+  console.log('  9) Copy router accounts into the app');
   const choice = await prompt(rl, 'Choice', '1');
   switch (choice) {
     case '1':
       await cmdSetup(rl, { forceRestore: false });
       break;
     case '2':
-      await wrap(TOOL_SCRIPTS.upload);
+      wrap(TOOL_SCRIPTS.upload);
       break;
     case '3':
-      await wrap(TOOL_SCRIPTS.parity);
+      wrap(TOOL_SCRIPTS.wan);
       break;
     case '4':
-      await wrap(TOOL_SCRIPTS.deviceMode);
+      wrap(TOOL_SCRIPTS.deviceMode);
       break;
     case '5':
-      await wrap(TOOL_SCRIPTS.garden, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      wrap(TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
       break;
     case '6':
-      await wrap(TOOL_SCRIPTS.pull);
+      wrap(TOOL_SCRIPTS.pull);
       break;
     case '7':
       await cmdRestore(rl, false);
@@ -535,23 +540,27 @@ async function main() {
       return;
     }
     if (first === 'upload-hotspot') {
-      await wrap(TOOL_SCRIPTS.upload);
+      wrap(TOOL_SCRIPTS.upload);
       return;
     }
-    if (first === 'wan' || first === 'router-parity-fix') {
-      await wrap(TOOL_SCRIPTS.parity);
+    if (first === 'wan') {
+      wrap(TOOL_SCRIPTS.wan);
+      return;
+    }
+    if (first === 'router-parity-fix') {
+      wrap(TOOL_SCRIPTS.parity);
       return;
     }
     if (first === 'device-mode') {
-      await wrap(TOOL_SCRIPTS.deviceMode);
+      wrap(TOOL_SCRIPTS.deviceMode);
       return;
     }
     if (first === 'apply-portal-network') {
-      await wrap(TOOL_SCRIPTS.garden, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      wrap(TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
       return;
     }
     if (first === 'pull-backup') {
-      await wrap(TOOL_SCRIPTS.pull);
+      wrap(TOOL_SCRIPTS.pull);
       return;
     }
     if (first === 'bootstrap') {
