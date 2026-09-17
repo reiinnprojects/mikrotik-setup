@@ -2,7 +2,8 @@
 
 /**
  * mikrotiksetup — onboard a LokalFi MikroTik from the NUC terminal.
- * Calls lokalfi-captive-portal npm scripts. Gold backups live in this repo.
+ * Runs bash helpers in this repo (scripts/). Portal checkout is only for
+ * flash HTML, docker/.env, and docker:bootstrap-mikrotik.
  */
 
 const { spawnSync } = require('child_process');
@@ -152,14 +153,50 @@ function modelLabel(model) {
   return '';
 }
 
-function runNpm(root, script, extra = [], extraEnv = {}) {
-  info(`npm run ${script}${extra.length ? ' -- ' + extra.join(' ') : ''}`);
-  const r = spawnSync('npm', ['run', script, '--', ...extra], {
-    cwd: root,
+const TOOL_SCRIPTS = {
+  restore: 'mikrotik-restore-backup.sh',
+  formatSd: 'mikrotik-format-sd.sh',
+  upload: 'upload-hotspot-to-mikrotik.sh',
+  wan: 'mikrotik-fix-wan-internet.sh',
+  parity: 'mikrotik-router-parity-fix.sh',
+  deviceMode: 'mikrotik-enable-hotspot-device-mode.sh',
+  garden: 'mikrotik-apply-portal-network.sh',
+  pull: 'mikrotik-pull-backup.sh',
+};
+
+function toolEnv(extra = {}) {
+  return {
+    ...process.env,
+    MIKROTIK_PORTAL_ROOT: portalRoot(),
+    ...extra,
+  };
+}
+
+function runTool(scriptFile, extra = [], extraEnv = {}) {
+  const script = path.join(TOOL_ROOT, 'scripts', scriptFile);
+  if (!fs.existsSync(script)) {
+    err(`Missing ${script}`);
+    return 1;
+  }
+  info(`bash scripts/${scriptFile}${extra.length ? ' ' + extra.join(' ') : ''}`);
+  const r = spawnSync('bash', [script, ...extra], {
     stdio: 'inherit',
-    env: { ...process.env, ...extraEnv },
+    env: toolEnv(extraEnv),
   });
   return r.status || 0;
+}
+
+function probeFormatSlots(host, extraEnv) {
+  const script = path.join(TOOL_ROOT, 'scripts', TOOL_SCRIPTS.formatSd);
+  const r = spawnSync('bash', [script, '--probe', host], {
+    encoding: 'utf8',
+    env: toolEnv(extraEnv),
+  });
+  const slots = String(r.stdout || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => /^(sd|usb|disk)[0-9]+$/i.test(s));
+  return { status: r.status == null ? 1 : r.status, slots, stderr: r.stderr || '' };
 }
 
 function mikrotikEnv(sess, extra = {}) {
@@ -177,6 +214,7 @@ function printHelp() {
 Usage:
   mikrotiksetup                 interactive menu (Enter = everything)
   mikrotiksetup setup           full 09-17 gold onboard
+  mikrotiksetup setup --skip-restore   continue from device-mode (no gold load)
   mikrotiksetup config          set path to lokalfi-captive-portal
   mikrotiksetup upload-hotspot
   mikrotiksetup wan
@@ -192,6 +230,7 @@ until you are on the same LAN (or add 192.168.88.x yourself). After restore: 192
 on ether2-LAN, admin / lokalfi.net. Device-mode still needs a short reset tap on the box.
 
 Gold backups are 09-17 (July voucher set). Lab serial ${LAB_SERIAL} is blocked unless --force.
+Helpers live in this repo under scripts/. Portal path is only flash HTML + .env + Mongo bootstrap.
 `);
 }
 
@@ -265,10 +304,37 @@ function runBootstrap(root) {
     warn('Portal app container is not running. Start the Docker stack, then: mikrotiksetup bootstrap');
     return 1;
   }
-  return runNpm(root, 'docker:bootstrap-mikrotik');
+  info('npm run docker:bootstrap-mikrotik');
+  const r = spawnSync('npm', ['run', 'docker:bootstrap-mikrotik'], {
+    cwd: root,
+    stdio: 'inherit',
+  });
+  return r.status || 0;
 }
 
-async function cmdSetup(rl, forceRestore) {
+async function resolveRb750Slot(rl, host, extraEnv) {
+  for (;;) {
+    const probe = probeFormatSlots(host, extraEnv);
+    if (probe.slots.length === 1) {
+      info(`Mounted removable disk: ${probe.slots[0]}`);
+      return probe.slots[0];
+    }
+    if (probe.slots.length === 0) {
+      const a = await prompt(
+        rl,
+        'No mounted SD card. Insert one and press Enter to retry (or type skip)',
+        ''
+      );
+      if (a.toLowerCase() === 'skip') return null;
+      continue;
+    }
+    info('More than one mounted removable disk:');
+    probe.slots.forEach((s) => console.log(`  ${s}`));
+    return await prompt(rl, 'Slot to format', probe.slots[0]);
+  }
+}
+
+async function cmdSetup(rl, { forceRestore = false, skipRestore = false } = {}) {
   const root = portalRoot();
   warnEnvMismatch(root);
   const sess = await probeSession(rl);
@@ -276,33 +342,42 @@ async function cmdSetup(rl, forceRestore) {
   info(`Model ${model} serial ${sess.rb.serial || '?'}`);
 
   const env = mikrotikEnv(sess);
-  if (runNpm(root, 'mikrotik:enable-hotspot-device-mode', [], env) !== 0) {
+  if (runTool(TOOL_SCRIPTS.deviceMode, [sess.host], env) !== 0) {
     warn('Device-mode CLI finished with an error. Tap reset or power-cycle if the router asked for it, then continue.');
   }
 
-  const restoreArgs = ['--file', goldFile(model), '--wait', sess.host];
-  if (forceRestore || sess.rb.serial === LAB_SERIAL) {
-    if (sess.rb.serial === LAB_SERIAL && !forceRestore) {
-      err(`Refusing lab serial ${LAB_SERIAL}. Re-run with: mikrotiksetup restore --force`);
+  let after = {
+    host: sess.host,
+    user: sess.user,
+    password: sess.password,
+    rb: sess.rb,
+  };
+
+  if (!skipRestore) {
+    const restoreArgs = ['--file', goldFile(model), '--wait', sess.host];
+    if (forceRestore || sess.rb.serial === LAB_SERIAL) {
+      if (sess.rb.serial === LAB_SERIAL && !forceRestore) {
+        err(`Refusing lab serial ${LAB_SERIAL}. Re-run with: mikrotiksetup restore --force`);
+        process.exit(1);
+      }
+      restoreArgs.splice(2, 0, '--force');
+    }
+    if (runTool(TOOL_SCRIPTS.restore, restoreArgs, env) !== 0) {
       process.exit(1);
     }
-    restoreArgs.splice(2, 0, '--force');
-  }
-  if (runNpm(root, 'mikrotik:restore-backup', restoreArgs, env) !== 0) {
-    process.exit(1);
+    after = {
+      host: GOLD_LAN,
+      user: GOLD_CREDS.user,
+      password: GOLD_CREDS.password,
+    };
+    const rbOut = sshOk(after.host, after.user, after.password, '/system routerboard print');
+    if (!rbOut) {
+      err(`No SSH on ${GOLD_LAN} after restore. Plug the NUC into ether2-LAN on 192.168.10.0/24.`);
+      process.exit(1);
+    }
+    after.rb = parseRouterboard(rbOut);
   }
 
-  const after = {
-    host: GOLD_LAN,
-    user: GOLD_CREDS.user,
-    password: GOLD_CREDS.password,
-  };
-  const rbOut = sshOk(after.host, after.user, after.password, '/system routerboard print');
-  if (!rbOut) {
-    err(`No SSH on ${GOLD_LAN} after restore. Plug the NUC into ether2-LAN on 192.168.10.0/24.`);
-    process.exit(1);
-  }
-  after.rb = parseRouterboard(rbOut);
   const afterModel = requireModel(after);
   if (afterModel !== model) {
     err(`Model changed after restore (${model} → ${afterModel}). Stop.`);
@@ -310,41 +385,37 @@ async function cmdSetup(rl, forceRestore) {
   }
 
   info('Re-checking device-mode hotspot=yes ...');
-  runNpm(root, 'mikrotik:enable-hotspot-device-mode', ['--verify-only'], mikrotikEnv(after));
+  runTool(TOOL_SCRIPTS.deviceMode, ['--verify-only', after.host], mikrotikEnv(after));
 
   const afterEnv = mikrotikEnv(after);
   if (afterModel === 'RB750Gr3') {
-    if (runNpm(root, 'mikrotik:fix-wan-internet', [], afterEnv) !== 0) {
-      warn('WAN parity returned non-zero.');
+    if (runTool(TOOL_SCRIPTS.wan, [after.host], afterEnv) !== 0) {
+      warn('WAN parity returned non-zero. Continuing.');
     }
-    const probe = spawnSync('npm', ['run', 'mikrotik:format-sd', '--', '--probe', after.host], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ...afterEnv },
-    });
-    if (probe.status === 2) {
-      err('No SD card. Insert a card and run: mikrotiksetup format-sd  then  mikrotiksetup upload-hotspot');
-      process.exit(1);
+    const slot = await resolveRb750Slot(rl, after.host, afterEnv);
+    if (!slot) {
+      warn('Skipped SD format/upload. Insert a card later: mikrotiksetup format-sd then mikrotiksetup upload-hotspot');
+    } else {
+        const fmtRc = runTool(TOOL_SCRIPTS.formatSd, ['--yes', '--slot', slot, after.host], afterEnv);
+        if (fmtRc !== 0) {
+          warn('SD did not mount after format (card may have I/O errors). Uploading hotspot to internal flash so the portal still works.');
+          if (runTool(TOOL_SCRIPTS.upload, [after.host], { ...afterEnv, MIKROTIK_ROUTER_FILES_DISK: 'flash' }) !== 0) {
+            warn('Upload failed. Retry: mikrotiksetup upload-hotspot');
+          }
+        } else {
+          const uploadDisk = /-part[0-9]+$/i.test(slot) ? slot : `${slot}-part1`;
+          if (runTool(TOOL_SCRIPTS.upload, [after.host], { ...afterEnv, MIKROTIK_ROUTER_FILES_DISK: uploadDisk }) !== 0) {
+            warn('Upload to SD failed. Retry: mikrotiksetup upload-hotspot');
+          }
+        }
     }
-    if (probe.status === 3) {
-      err('More than one removable disk. Unplug extras or: mikrotiksetup format-sd  (it will ask for --slot)');
-      process.exit(1);
-    }
-    if (runNpm(root, 'mikrotik:format-sd', ['--yes', after.host], afterEnv) !== 0) {
-      process.exit(1);
-    }
-    if (runNpm(root, 'mikrotik:upload-hotspot', [after.host], { ...afterEnv, MIKROTIK_REQUIRE_REMOVABLE: 'true' }) !== 0) {
-      process.exit(1);
-    }
-  } else {
-    if (runNpm(root, 'mikrotik:upload-hotspot', [after.host], { ...afterEnv, MIKROTIK_ROUTER_FILES_DISK: 'flash' }) !== 0) {
-      process.exit(1);
-    }
+  } else if (runTool(TOOL_SCRIPTS.upload, [after.host], { ...afterEnv, MIKROTIK_ROUTER_FILES_DISK: 'flash' }) !== 0) {
+    warn('Upload failed. Retry: mikrotiksetup upload-hotspot');
   }
 
   const lan = nucLanIp(root);
-  if (runNpm(root, 'mikrotik:apply-portal-network', [after.host], { ...afterEnv, NUC_LAN_IP: lan }) !== 0) {
-    process.exit(1);
+  if (runTool(TOOL_SCRIPTS.garden, [after.host], { ...afterEnv, NUC_LAN_IP: lan }) !== 0) {
+    warn('Portal network failed. Retry: mikrotiksetup apply-portal-network');
   }
 
   runBootstrap(root);
@@ -352,22 +423,19 @@ async function cmdSetup(rl, forceRestore) {
 }
 
 async function cmdRestore(rl, force) {
-  const root = portalRoot();
   const sess = await probeSession(rl);
   const model = requireModel(sess);
   const args = ['--file', goldFile(model), sess.host];
   if (force) args.splice(2, 0, '--force');
-  process.exit(runNpm(root, 'mikrotik:restore-backup', args, mikrotikEnv(sess)));
+  process.exit(runTool(TOOL_SCRIPTS.restore, args, mikrotikEnv(sess)));
 }
 
 async function cmdFormat(rl) {
-  const root = portalRoot();
   const sess = await probeSession(rl);
-  process.exit(runNpm(root, 'mikrotik:format-sd', [sess.host], mikrotikEnv(sess)));
+  process.exit(runTool(TOOL_SCRIPTS.formatSd, [sess.host], mikrotikEnv(sess)));
 }
 
-async function wrap(script, extra = [], extraEnv = {}) {
-  const root = portalRoot();
+async function wrap(scriptFile, extra = [], extraEnv = {}) {
   const host = process.env.MIKROTIK_HOST || GOLD_LAN;
   const env = {
     MIKROTIK_HOST: host,
@@ -375,7 +443,7 @@ async function wrap(script, extra = [], extraEnv = {}) {
     MIKROTIK_PASSWORD: process.env.MIKROTIK_PASSWORD || GOLD_CREDS.password,
     ...extraEnv,
   };
-  process.exit(runNpm(root, script, extra.length ? extra : [host], env));
+  process.exit(runTool(scriptFile, extra.length ? extra : [host], env));
 }
 
 async function menu(rl) {
@@ -393,22 +461,22 @@ async function menu(rl) {
   const choice = await prompt(rl, 'Choice', '1');
   switch (choice) {
     case '1':
-      await cmdSetup(rl, false);
+      await cmdSetup(rl, { forceRestore: false });
       break;
     case '2':
-      await wrap('mikrotik:upload-hotspot');
+      await wrap(TOOL_SCRIPTS.upload);
       break;
     case '3':
-      await wrap('mikrotik:router-parity-fix');
+      await wrap(TOOL_SCRIPTS.parity);
       break;
     case '4':
-      await wrap('mikrotik:enable-hotspot-device-mode');
+      await wrap(TOOL_SCRIPTS.deviceMode);
       break;
     case '5':
-      await wrap('mikrotik:apply-portal-network', [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      await wrap(TOOL_SCRIPTS.garden, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
       break;
     case '6':
-      await wrap('mikrotik:pull-backup');
+      await wrap(TOOL_SCRIPTS.pull);
       break;
     case '7':
       await cmdRestore(rl, false);
@@ -435,7 +503,8 @@ async function configCmd(rl) {
 async function main() {
   const raw = process.argv.slice(2);
   const force = raw.includes('--force');
-  const argv = raw.filter((a) => a !== '--force');
+  const skipRestore = raw.includes('--skip-restore');
+  const argv = raw.filter((a) => a !== '--force' && a !== '--skip-restore');
   const first = argv[0];
 
   if (first === '--help' || first === '-h' || first === 'help') {
@@ -454,7 +523,7 @@ async function main() {
       return;
     }
     if (first === 'setup' || first === 'everything') {
-      await cmdSetup(rl, force);
+      await cmdSetup(rl, { forceRestore: force, skipRestore });
       return;
     }
     if (first === 'restore') {
@@ -466,23 +535,23 @@ async function main() {
       return;
     }
     if (first === 'upload-hotspot') {
-      await wrap('mikrotik:upload-hotspot');
+      await wrap(TOOL_SCRIPTS.upload);
       return;
     }
     if (first === 'wan' || first === 'router-parity-fix') {
-      await wrap('mikrotik:router-parity-fix');
+      await wrap(TOOL_SCRIPTS.parity);
       return;
     }
     if (first === 'device-mode') {
-      await wrap('mikrotik:enable-hotspot-device-mode');
+      await wrap(TOOL_SCRIPTS.deviceMode);
       return;
     }
     if (first === 'apply-portal-network') {
-      await wrap('mikrotik:apply-portal-network', [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      await wrap(TOOL_SCRIPTS.garden, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
       return;
     }
     if (first === 'pull-backup') {
-      await wrap('mikrotik:pull-backup');
+      await wrap(TOOL_SCRIPTS.pull);
       return;
     }
     if (first === 'bootstrap') {
