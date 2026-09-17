@@ -1,0 +1,19 @@
+{
+  "name": "mikrotiksetup",
+  "version": "1.0.0",
+  "description": "Interactive MikroTik onboarder for LokalFi (gold restore, flash upload, device-mode)",
+  "main": "bin/mikrotiksetup.js",
+  "bin": {
+    "mikrotiksetup": "./bin/mikrotiksetup.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "lokalfi",
+    "mikrotik",
+    "setup"
+  ],
+  "license": "MIT",
+  "dependencies": {}
+}
