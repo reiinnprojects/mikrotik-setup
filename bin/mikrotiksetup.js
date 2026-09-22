@@ -23,6 +23,7 @@ const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const DEFAULT_PORTAL = path.join(os.homedir(), 'Developer', 'lokalfi', 'lokalfi-captive-portal');
 const GOLD_CREDS = { user: 'admin', password: 'lokalfi.net' };
 const GOLD_LAN = '192.168.10.1';
+const HOTSPOT_GW = '10.0.0.1';
 const LAB_SERIAL = 'HJC0A5MY028';
 
 function info(t) {
@@ -132,6 +133,38 @@ function commandExists(name) {
   return spawnSync('sh', ['-c', `command -v ${name}`], { encoding: 'utf8' }).status === 0;
 }
 
+function closeReadline(rl) {
+  if (rl && typeof rl.close === 'function') {
+    rl.close();
+  }
+}
+
+function routerHostCandidates(preferred) {
+  const seen = new Set();
+  const out = [];
+  for (const h of [preferred, process.env.MIKROTIK_HOST, GOLD_LAN, HOTSPOT_GW].filter(Boolean)) {
+    const t = String(h).trim();
+    if (t && !seen.has(t)) {
+      seen.add(t);
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+function sshSession(preferred, user, password, cmd) {
+  for (const h of routerHostCandidates(preferred)) {
+    const out = sshOk(h, user, password, cmd);
+    if (out) return { host: h, out };
+  }
+  return null;
+}
+
+function formatSlotFromVolume(vol) {
+  const m = /^(sd|usb|disk)[0-9]+/i.exec(vol || '');
+  return m ? m[0].toLowerCase() : String(vol || '').toLowerCase();
+}
+
 function parseRouterboard(text) {
   const model = (text.match(/^\s*model:\s*(.+)$/m) || [])[1];
   let serial = (text.match(/^\s*serial-number:\s*(.+)$/m) || [])[1];
@@ -188,11 +221,22 @@ function probeFormatSlots(host, extraEnv) {
     encoding: 'utf8',
     env: toolEnv(extraEnv),
   });
-  const slots = String(r.stdout || '')
+  return String(r.stdout || '')
     .split('\n')
     .map((s) => s.trim())
     .filter((s) => /^(sd|usb|disk)[0-9]+$/i.test(s));
-  return { status: r.status == null ? 1 : r.status, slots, stderr: r.stderr || '' };
+}
+
+function probeUploadDisks(host, extraEnv) {
+  const script = path.join(TOOL_ROOT, 'scripts', TOOL_SCRIPTS.upload);
+  const r = spawnSync('bash', [script, '--probe-disks', host], {
+    encoding: 'utf8',
+    env: toolEnv(extraEnv),
+  });
+  return String(r.stdout || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => /^(sd|usb|disk)[0-9]+(-part[0-9]+)?$/i.test(s));
 }
 
 function mikrotikEnv(sess, extra = {}) {
@@ -238,19 +282,12 @@ async function prompt(rl, q, def) {
 
 async function probeSession(rl) {
   let host = await prompt(rl, 'Router IP', GOLD_LAN);
-  info(`Trying ${GOLD_CREDS.user} / lokalfi.net on ${host} ...`);
-  let out = sshOk(host, GOLD_CREDS.user, GOLD_CREDS.password, '/system routerboard print');
-  if (out) {
-    ok('Logged in with existing LokalFi credentials.');
-    return { host, user: GOLD_CREDS.user, password: GOLD_CREDS.password, rb: parseRouterboard(out) };
-  }
-  if (host !== GOLD_LAN) {
-    info(`Trying ${GOLD_LAN} with the same credentials ...`);
-    out = sshOk(GOLD_LAN, GOLD_CREDS.user, GOLD_CREDS.password, '/system routerboard print');
-    if (out) {
-      ok(`Reached ${GOLD_LAN} with LokalFi credentials.`);
-      return { host: GOLD_LAN, user: GOLD_CREDS.user, password: GOLD_CREDS.password, rb: parseRouterboard(out) };
-    }
+  info(`Trying ${GOLD_CREDS.user} / lokalfi.net ...`);
+  const gold = sshSession(host, GOLD_CREDS.user, GOLD_CREDS.password, '/system routerboard print');
+  if (gold) {
+    if (gold.host !== host.trim()) ok(`Reached ${gold.host} with LokalFi credentials.`);
+    else ok('Logged in with existing LokalFi credentials.');
+    return { host: gold.host, user: GOLD_CREDS.user, password: GOLD_CREDS.password, rb: parseRouterboard(gold.out) };
   }
   warn('admin / lokalfi.net failed. Treat as a new router. Sticker user/password next.');
   warn('If the IP is 192.168.88.1, this PC must already be on that subnet.');
@@ -260,8 +297,9 @@ async function probeSession(rl) {
     err('Password required for a factory router.');
     process.exit(1);
   }
-  out = sshOk(host, user, password, '/system routerboard print');
-  if (!out) {
+  let factory = sshSession(host, user, password, '/system routerboard print');
+  if (factory) host = factory.host;
+  if (!factory) {
     err(`SSH failed to ${user}@${host}. Check IP, cable, and subnet.`);
     process.exit(1);
   }
@@ -269,14 +307,14 @@ async function probeSession(rl) {
   const setPw = sshOk(host, user, password, '/user set [find name=admin] password="lokalfi.net"');
   if (setPw === null) {
     warn('Could not set admin password. Restore may still set admin / lokalfi.net.');
-    return { host, user, password, rb: parseRouterboard(out), factory: true };
+    return { host, user, password, rb: parseRouterboard(factory.out), factory: true };
   }
   const again = sshOk(host, GOLD_CREDS.user, GOLD_CREDS.password, '/system routerboard print');
   if (again) {
     ok('admin / lokalfi.net works.');
     return { host, user: GOLD_CREDS.user, password: GOLD_CREDS.password, rb: parseRouterboard(again), factory: true };
   }
-  return { host, user, password, rb: parseRouterboard(out), factory: true };
+  return { host, user, password, rb: parseRouterboard(factory.out), factory: true };
 }
 
 function requireModel(sess) {
@@ -318,12 +356,23 @@ function uploadHotspot(host, extraEnv, disk) {
 
 async function resolveRb750Slot(rl, host, extraEnv) {
   for (;;) {
-    const probe = probeFormatSlots(host, extraEnv);
-    if (probe.slots.length === 1) {
-      info(`Mounted removable disk: ${probe.slots[0]}`);
-      return probe.slots[0];
+    const slots = probeFormatSlots(host, extraEnv);
+    if (slots.length === 1) {
+      info(`Mounted removable disk: ${slots[0]}`);
+      return slots[0];
     }
-    if (probe.slots.length === 0) {
+    if (slots.length === 0) {
+      const uploadVolumes = probeUploadDisks(host, extraEnv);
+      if (uploadVolumes.length === 1) {
+        const vol = uploadVolumes[0];
+        info(`Removable volume detected via upload probe: ${vol}`);
+        return formatSlotFromVolume(vol);
+      }
+      if (uploadVolumes.length > 1) {
+        info('Multiple removable volumes (upload probe):');
+        uploadVolumes.forEach((s) => console.log(`  ${s}`));
+        return await prompt(rl, 'Volume to format (parent slot)', formatSlotFromVolume(uploadVolumes[0]));
+      }
       if (!process.stdin.isTTY) {
         warn('No SD card. Using internal flash.');
         return null;
@@ -338,8 +387,8 @@ async function resolveRb750Slot(rl, host, extraEnv) {
       return null;
     }
     info('More than one mounted removable disk:');
-    probe.slots.forEach((s) => console.log(`  ${s}`));
-    return await prompt(rl, 'Slot to format', probe.slots[0]);
+    slots.forEach((s) => console.log(`  ${s}`));
+    return await prompt(rl, 'Slot to format', slots[0]);
   }
 }
 
@@ -379,12 +428,13 @@ async function cmdSetup(rl, { forceRestore = false, skipRestore = false } = {}) 
       user: GOLD_CREDS.user,
       password: GOLD_CREDS.password,
     };
-    const rbOut = sshOk(after.host, after.user, after.password, '/system routerboard print');
-    if (!rbOut) {
-      err(`No SSH on ${GOLD_LAN} after restore. Plug this PC into ether2-LAN on 192.168.10.0/24.`);
+    const restored = sshSession(GOLD_LAN, after.user, after.password, '/system routerboard print');
+    if (!restored) {
+      err(`No SSH on ${GOLD_LAN} or ${HOTSPOT_GW} after restore. Plug this PC into ether2-LAN on 192.168.10.0/24.`);
       process.exit(1);
     }
-    after.rb = parseRouterboard(rbOut);
+    after.host = restored.host;
+    after.rb = parseRouterboard(restored.out);
   }
 
   const afterModel = requireModel(after);
@@ -397,20 +447,24 @@ async function cmdSetup(rl, { forceRestore = false, skipRestore = false } = {}) 
   runTool(TOOL_SCRIPTS.deviceMode, ['--verify-only', after.host], mikrotikEnv(after));
 
   const afterEnv = mikrotikEnv(after);
+  let rb750Slot = null;
   if (afterModel === 'RB750Gr3') {
     if (runTool(TOOL_SCRIPTS.wan, [after.host], afterEnv) !== 0) {
       warn('WAN fix returned non-zero. Continuing.');
     }
-    const slot = await resolveRb750Slot(rl, after.host, afterEnv);
-    if (!slot) {
+    rb750Slot = await resolveRb750Slot(rl, after.host, afterEnv);
+  }
+  closeReadline(rl);
+  if (afterModel === 'RB750Gr3') {
+    if (!rb750Slot) {
       uploadHotspot(after.host, afterEnv, 'flash');
     } else {
-      const fmtRc = runTool(TOOL_SCRIPTS.formatSd, ['--yes', '--slot', slot, after.host], afterEnv);
+      const fmtRc = runTool(TOOL_SCRIPTS.formatSd, ['--yes', '--slot', rb750Slot, after.host], afterEnv);
       if (fmtRc !== 0) {
         warn('SD did not mount after format. Uploading hotspot to internal flash.');
         uploadHotspot(after.host, afterEnv, 'flash');
       } else {
-        const uploadDisk = /-part[0-9]+$/i.test(slot) ? slot : `${slot}-part1`;
+        const uploadDisk = /-part[0-9]+$/i.test(rb750Slot) ? rb750Slot : `${rb750Slot}-part1`;
         uploadHotspot(after.host, afterEnv, uploadDisk);
       }
     }
@@ -432,23 +486,32 @@ async function cmdRestore(rl, force) {
   const model = requireModel(sess);
   const args = ['--file', goldFile(model), sess.host];
   if (force) args.splice(2, 0, '--force');
+  closeReadline(rl);
   process.exit(runTool(TOOL_SCRIPTS.restore, args, mikrotikEnv(sess)));
 }
 
 async function cmdFormat(rl) {
   const sess = await probeSession(rl);
+  closeReadline(rl);
   process.exit(runTool(TOOL_SCRIPTS.formatSd, [sess.host], mikrotikEnv(sess)));
 }
 
-function wrap(scriptFile, extra = [], extraEnv = {}) {
-  const host = process.env.MIKROTIK_HOST || GOLD_LAN;
-  const env = {
-    MIKROTIK_HOST: host,
-    MIKROTIK_USER: process.env.MIKROTIK_USER || GOLD_CREDS.user,
-    MIKROTIK_PASSWORD: process.env.MIKROTIK_PASSWORD || GOLD_CREDS.password,
-    ...extraEnv,
-  };
-  process.exit(runTool(scriptFile, extra.length ? extra : [host], env));
+function wrap(rl, scriptFile, extra = [], extraEnv = {}) {
+  closeReadline(rl);
+  const user = process.env.MIKROTIK_USER || GOLD_CREDS.user;
+  const pass = process.env.MIKROTIK_PASSWORD || GOLD_CREDS.password;
+  const preferred = process.env.MIKROTIK_HOST || GOLD_LAN;
+  const hit = sshSession(preferred, user, pass);
+  const host = hit ? hit.host : String(preferred).trim() || GOLD_LAN;
+  if (host === HOTSPOT_GW) warn(`${GOLD_LAN} unreachable — using hotspot gateway ${HOTSPOT_GW}.`);
+  process.exit(
+    runTool(scriptFile, extra.length ? extra : [host], {
+      MIKROTIK_HOST: host,
+      MIKROTIK_USER: user,
+      MIKROTIK_PASSWORD: pass,
+      ...extraEnv,
+    })
+  );
 }
 
 async function menu(rl) {
@@ -469,19 +532,19 @@ async function menu(rl) {
       await cmdSetup(rl, { forceRestore: false });
       break;
     case '2':
-      wrap(TOOL_SCRIPTS.upload);
+      wrap(rl, TOOL_SCRIPTS.upload);
       break;
     case '3':
-      wrap(TOOL_SCRIPTS.wan);
+      wrap(rl, TOOL_SCRIPTS.wan);
       break;
     case '4':
-      wrap(TOOL_SCRIPTS.deviceMode);
+      wrap(rl, TOOL_SCRIPTS.deviceMode);
       break;
     case '5':
-      wrap(TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      wrap(rl, TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
       break;
     case '6':
-      wrap(TOOL_SCRIPTS.pull);
+      wrap(rl, TOOL_SCRIPTS.pull);
       break;
     case '7':
       await cmdRestore(rl, false);
@@ -490,6 +553,7 @@ async function menu(rl) {
       await cmdFormat(rl);
       break;
     case '9':
+      closeReadline(rl);
       process.exit(runBootstrap(portalRoot()));
       break;
     default:
@@ -540,30 +604,31 @@ async function main() {
       return;
     }
     if (first === 'upload-hotspot') {
-      wrap(TOOL_SCRIPTS.upload);
+      wrap(rl, TOOL_SCRIPTS.upload);
       return;
     }
     if (first === 'wan') {
-      wrap(TOOL_SCRIPTS.wan);
+      wrap(rl, TOOL_SCRIPTS.wan);
       return;
     }
     if (first === 'router-parity-fix') {
-      wrap(TOOL_SCRIPTS.parity);
+      wrap(rl, TOOL_SCRIPTS.parity);
       return;
     }
     if (first === 'device-mode') {
-      wrap(TOOL_SCRIPTS.deviceMode);
+      wrap(rl, TOOL_SCRIPTS.deviceMode);
       return;
     }
     if (first === 'apply-portal-network') {
-      wrap(TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      wrap(rl, TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
       return;
     }
     if (first === 'pull-backup') {
-      wrap(TOOL_SCRIPTS.pull);
+      wrap(rl, TOOL_SCRIPTS.pull);
       return;
     }
     if (first === 'bootstrap') {
+      closeReadline(rl);
       process.exit(runBootstrap(portalRoot()));
     }
     err(`Unknown command: ${first}`);

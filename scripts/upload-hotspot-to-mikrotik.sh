@@ -61,6 +61,12 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   exit 0
 fi
 
+PROBE_DISKS=false
+if [ "${1:-}" = "--probe-disks" ]; then
+  PROBE_DISKS=true
+  shift
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -n "${MIKROTIK_PORTAL_ROOT:-}" ]; then
   REPO_ROOT="${MIKROTIK_PORTAL_ROOT}"
@@ -193,6 +199,7 @@ if [ -z "${MIKROTIK_PASSWORD:-}" ]; then
 fi
 
 DEFAULT_MIKROTIK_IP="192.168.10.1"
+HOTSPOT_GATEWAY_IP="10.0.0.1"
 if [ -n "${1:-}" ]; then
   HOST="$1"
 elif [ -n "${MIKROTIK_HOST:-}" ]; then
@@ -203,7 +210,7 @@ else
   HOST="$DEFAULT_MIKROTIK_IP"
 fi
 
-if [ ! -d "$SOURCE_DIR" ]; then
+if [ "$PROBE_DISKS" != true ] && [ ! -d "$SOURCE_DIR" ]; then
   printf "%s\n" "${RED}[ERROR] Missing hotspot folder: ${SOURCE_DIR}${NC}"
   exit 1
 fi
@@ -228,8 +235,6 @@ fi
 if [ "$PASSWORD_FROM_DOCKER_ENV" = true ]; then
   printf "%s\n" "${BLUE}[INFO] Using MikroTik password from ${DOCKER_ENV_FILE}${NC}"
 fi
-
-printf "%s\n" "${BLUE}[INFO] Router ${HOST} (${USER_NAME}, port ${PORT})${NC}"
 
 # Shared SSH options (multiplexing speeds up many per-file scp calls).
 # OpenSSH enforces a short ControlPath (~104 chars). macOS TMPDIR under /var/folders/... exceeds it;
@@ -260,20 +265,35 @@ _clear_stale_known_host_for_router() {
   fi
 }
 
-_clear_stale_known_host_for_router
-
 # SSH into RouterOS CLI (same auth as scp). Used to wipe remote hotspot tree before upload.
 _run_ssh() {
   local remote_cmd="$1"
   if [ -n "${MIKROTIK_PASSWORD:-}" ] && command -v sshpass >/dev/null 2>&1; then
-    SSHPASS="$MIKROTIK_PASSWORD" sshpass -e ssh -p "$PORT" \
-      "${SSH_CONN_OPTS[@]}" \
-      "${USER_NAME}@${HOST}" "$remote_cmd"
+    SSHPASS="$MIKROTIK_PASSWORD" sshpass -e ssh -p "$PORT" -o ConnectTimeout=8 \
+      "${SSH_CONN_OPTS[@]}" "${USER_NAME}@${HOST}" "$remote_cmd"
   else
-    ssh -p "$PORT" \
-      "${SSH_CONN_OPTS[@]}" \
-      "${USER_NAME}@${HOST}" "$remote_cmd"
+    ssh -p "$PORT" -o ConnectTimeout=8 -o BatchMode=yes \
+      "${SSH_CONN_OPTS[@]}" "${USER_NAME}@${HOST}" "$remote_cmd"
   fi
+}
+
+# When this PC is on guest Wi-Fi, management LAN (192.168.10.1) may be unreachable; try hotspot gateway.
+_hotspot_gateway_fallback() {
+  if [ "$HOST" != "$DEFAULT_MIKROTIK_IP" ]; then
+    return 0
+  fi
+  if _run_ssh '/system identity print' >/dev/null 2>&1; then
+    return 0
+  fi
+  printf "%s\n" "${YELLOW}[WARNING] ${DEFAULT_MIKROTIK_IP} unreachable — trying hotspot gateway ${HOTSPOT_GATEWAY_IP} ...${NC}"
+  HOST="$HOTSPOT_GATEWAY_IP"
+  _clear_stale_known_host_for_router
+  if _run_ssh '/system identity print' >/dev/null 2>&1; then
+    printf "%s\n" "${BLUE}[INFO] Using router ${HOST}${NC}"
+    return 0
+  fi
+  HOST="$DEFAULT_MIKROTIK_IP"
+  return 1
 }
 
 # Normalize disk slot name from env or user input (flash, disk1, usb1, …).
@@ -505,6 +525,19 @@ EOF
     printf "%s\n" "${YELLOW}[WARNING] Invalid choice. Enter 1 or a number from the list.${NC}"
   done
 }
+
+_clear_stale_known_host_for_router
+
+_hotspot_gateway_fallback || true
+
+_clear_stale_known_host_for_router
+
+printf "%s\n" "${BLUE}[INFO] Router ${HOST} (${USER_NAME}, port ${PORT})${NC}"
+
+if [ "$PROBE_DISKS" = true ]; then
+  _list_router_removable_disks
+  exit 0
+fi
 
 _resolve_upload_disk_target
 

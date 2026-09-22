@@ -139,15 +139,9 @@ mounted=false
 for _i in $(seq 1 40); do
   sleep 3
   det="$(_run_ssh "/disk print detail where parent=${SLOT}" 2>/dev/null || true)"
-  if printf '%s\n' "$det" | grep -qE '^[ ]*[0-9]+[[:space:]]+.*M'; then
+  if printf '%s\n' "$det" | grep -qiE 'partition-size=[1-9]'; then
     mounted=true
     break
-  fi
-  if printf '%s\n' "$det" | grep -qi 'fs=exfat' && printf '%s\n' "$det" | grep -qv 'partition-size=0'; then
-    if printf '%s\n' "$det" | grep -qE 'partition-size=[1-9]'; then
-      mounted=true
-      break
-    fi
   fi
   printf "%s\n" "${BLUE}[INFO] Still waiting (${_i}/40) ...${NC}"
 done

@@ -134,6 +134,7 @@ mikrotik_ssh_bootstrap() {
   fi
 
   DEFAULT_MIKROTIK_IP="192.168.10.1"
+  HOTSPOT_GATEWAY_IP="10.0.0.1"
   if [ -n "$host_override" ]; then
     HOST="$host_override"
   elif [ -n "${MIKROTIK_HOST:-}" ]; then
@@ -166,8 +167,6 @@ mikrotik_ssh_bootstrap() {
     printf "%s\n" "${BLUE}[INFO] Using MikroTik password from ${DOCKER_ENV_FILE}${NC}"
   fi
 
-  printf "%s\n" "${BLUE}[INFO] Router ${HOST} (${USER_NAME}, port ${PORT})${NC}"
-
   SSH_MUX_CONTROL_PATH="/tmp/lmf-mikrotik-%C"
   SSH_CONN_OPTS=( -o StrictHostKeyChecking=accept-new )
   if [ "${MIKROTIK_SSH_NO_MUX:-}" != "true" ]; then
@@ -194,7 +193,40 @@ mikrotik_ssh_bootstrap() {
     fi
   }
 
+  _ssh_probe_host() {
+    local candidate="$1"
+    local probe_cmd='/system identity print'
+    if [ -n "${MIKROTIK_PASSWORD:-}" ] && command -v sshpass >/dev/null 2>&1; then
+      SSHPASS="$MIKROTIK_PASSWORD" sshpass -e ssh -p "$PORT" -o ConnectTimeout=8 \
+        "${SSH_CONN_OPTS[@]}" "${USER_NAME}@${candidate}" "$probe_cmd" >/dev/null 2>&1
+    else
+      ssh -p "$PORT" -o ConnectTimeout=8 -o BatchMode=yes \
+        "${SSH_CONN_OPTS[@]}" "${USER_NAME}@${candidate}" "$probe_cmd" >/dev/null 2>&1
+    fi
+  }
+
+  _apply_reachable_router_host() {
+    local primary="$1"
+    if _ssh_probe_host "$primary"; then
+      HOST="$primary"
+      return 0
+    fi
+    if [ "$primary" = "$DEFAULT_MIKROTIK_IP" ] && _ssh_probe_host "$HOTSPOT_GATEWAY_IP"; then
+      printf "%s\n" "${YELLOW}[WARNING] ${DEFAULT_MIKROTIK_IP} unreachable — using hotspot gateway ${HOTSPOT_GATEWAY_IP}.${NC}"
+      HOST="$HOTSPOT_GATEWAY_IP"
+      return 0
+    fi
+    HOST="$primary"
+    return 1
+  }
+
   _clear_stale_known_host_for_router
+
+  _apply_reachable_router_host "$HOST" || true
+
+  _clear_stale_known_host_for_router
+
+  printf "%s\n" "${BLUE}[INFO] Router ${HOST} (${USER_NAME}, port ${PORT})${NC}"
 
   _run_ssh() {
     local remote_cmd="$1"
