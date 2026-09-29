@@ -190,6 +190,7 @@ const TOOL_SCRIPTS = {
   parity: 'mikrotik-router-parity-fix.sh',
   deviceMode: 'mikrotik-enable-hotspot-device-mode.sh',
   portalNetwork: 'mikrotik-apply-portal-network.sh',
+  refreshPortalDns: 'mikrotik-refresh-portal-dns.sh',
   pull: 'mikrotik-pull-backup.sh',
 };
 
@@ -260,6 +261,7 @@ Usage:
   mikrotiksetup wan
   mikrotiksetup device-mode
   mikrotiksetup apply-portal-network
+  mikrotiksetup refresh-portal-dns
   mikrotiksetup pull-backup
   mikrotiksetup restore
   mikrotiksetup format-sd
@@ -621,6 +623,10 @@ async function main() {
     }
     if (first === 'apply-portal-network') {
       wrap(rl, TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      return;
+    }
+    if (first === 'refresh-portal-dns') {
+      wrap(rl, TOOL_SCRIPTS.refreshPortalDns);
       return;
     }
     if (first === 'pull-backup') {

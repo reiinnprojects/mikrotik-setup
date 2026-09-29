@@ -50,6 +50,7 @@ Serial **HJC0A5MY028** is refused unless `mikrotiksetup restore --force` / `mikr
 | `mikrotiksetup wan` | `scripts/mikrotik-fix-wan-internet.sh` |
 | `mikrotiksetup device-mode` | `scripts/mikrotik-enable-hotspot-device-mode.sh` |
 | `mikrotiksetup apply-portal-network` | `scripts/mikrotik-apply-portal-network.sh` |
+| `mikrotiksetup refresh-portal-dns` | `scripts/mikrotik-refresh-portal-dns.sh` (Tanay `lokalfi.net` D row) |
 | `mikrotiksetup pull-backup` | `scripts/mikrotik-pull-backup.sh` |
 | `mikrotiksetup restore` | `scripts/mikrotik-restore-backup.sh` |
 | `mikrotiksetup format-sd` | `scripts/mikrotik-format-sd.sh` |

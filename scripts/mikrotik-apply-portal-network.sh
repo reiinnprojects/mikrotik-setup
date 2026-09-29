@@ -15,6 +15,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/_mikrotik-ssh-bootstrap.sh"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_mikrotik-portal-dns-heal.sh"
 
 NUC_LAN_IP="${NUC_LAN_IP:-192.168.10.220}"
 STARBOOKS_IP="${STARBOOKS_IP:-192.168.10.230}"
@@ -128,4 +130,7 @@ printf "%s\n" "${BLUE}[INFO] Current walled-garden (hostname):${NC}"
 _run_ssh '/ip hotspot walled-garden print where disabled=no'
 printf "%s\n" "${BLUE}[INFO] Current walled-garden ip:${NC}"
 _run_ssh '/ip hotspot walled-garden ip print'
+refresh_hotspot_portal_dns
+verify_hotspot_portal_dns
+
 printf "%s\n" "${GREEN}[SUCCESS] Portal network rules applied (existing comments left unchanged).${NC}"
