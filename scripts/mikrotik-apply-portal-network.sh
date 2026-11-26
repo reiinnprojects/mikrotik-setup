@@ -1,13 +1,16 @@
 #!/bin/bash
 # Idempotent Lokalfi split-DNS + hotspot walled garden (portal + Tier A/C on-prem ports).
+# Also advertises the Captive Portal API (DHCP option 114) and keeps each phone's
+# address visible on TCP/443 to the NUC. HTTP voucher traffic stays masqueraded.
+# Does not create or remove hotspot users or user profiles.
 #
 # Usage:
-#   bash deployment/scripts/mikrotik-apply-portal-network.sh [options] [MIKROTIK_HOST]
-#   npm run mikrotik:apply-portal-network
+#   bash scripts/mikrotik-apply-portal-network.sh [options] [MIKROTIK_HOST]
 #
 # Environment:
 #   NUC_LAN_IP=192.168.10.220
 #   STARBOOKS_IP=192.168.10.230
+#   CAPTIVE_PORTAL_API_URL=https://app.lokalfi.net/api/captive-portal
 #   MIKROTIK_* — same as other mikrotik scripts (see _mikrotik-ssh-bootstrap.sh)
 
 set -e
@@ -21,17 +24,23 @@ source "${SCRIPT_DIR}/_mikrotik-portal-dns-heal.sh"
 NUC_LAN_IP="${NUC_LAN_IP:-192.168.10.220}"
 STARBOOKS_IP="${STARBOOKS_IP:-192.168.10.230}"
 DRY_RUN=false
+KEEP_HOTSPOT_PROFILE=false
 HOST_OVERRIDE=""
 
 usage() {
-  printf "%s\n" "${BLUE}[INFO] Usage: $0 [--dry-run] [MIKROTIK_HOST]${NC}"
+  printf "%s\n" "${BLUE}[INFO] Usage: $0 [--dry-run] [--keep-hotspot-profile] [MIKROTIK_HOST]${NC}"
   printf "%s\n" "  NUC_LAN_IP=${NUC_LAN_IP} STARBOOKS_IP=${STARBOOKS_IP}"
+  printf "%s\n" "  --keep-hotspot-profile  do not set hsprof1 dns-name or hotspot-address, and do not bounce hotspot1"
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)
       DRY_RUN=true
+      shift
+      ;;
+    --keep-hotspot-profile)
+      KEEP_HOTSPOT_PROFILE=true
       shift
       ;;
     -h | --help)
@@ -121,6 +130,25 @@ ensure_wg_ip "***access on-premises-apps 1/2 [wg ip]" "$NUC_LAN_IP" "8080-8089"
 ensure_wg_ip "***access on-premises-apps 2/2 [wg ip]" "$NUC_LAN_IP" "8090-8099"
 ensure_wg_ip "***access STARBOOKS [wg ip]" "$STARBOOKS_IP" ""
 
+# Phones only honor DHCP option 114 over HTTPS. 503 from the API falls back to the HTTP login sheet.
+ensure_captive_portal_dhcp() {
+  local api_url="${CAPTIVE_PORTAL_API_URL:-https://app.lokalfi.net/api/captive-portal}"
+  local api_esc
+  api_esc="$(ros_escape "$api_url")"
+  run_ros ":if ([:len [/ip dhcp-server option find where name=\"lokalfi-captive-portal\"]] = 0) do={ /ip dhcp-server option add code=114 force=yes name=\"lokalfi-captive-portal\" value=\"'${api_esc}'\" } else={ /ip dhcp-server option set [find where name=\"lokalfi-captive-portal\"] code=114 force=yes value=\"'${api_esc}'\" }"
+  run_ros ":local id [/ip dhcp-server network find where address=\"10.0.0.0/24\"]; :if ([:len \$id] > 0) do={ :local cur \"\"; :do { :set cur [/ip dhcp-server network get \$id dhcp-option] } on-error={}; :local pos [:find [:tostr \$cur] \"lokalfi-captive-portal\"]; :if ([:typeof \$pos] = \"nil\") do={ :if ([:len [:tostr \$cur]] = 0) do={ /ip dhcp-server network set \$id dhcp-option=\"lokalfi-captive-portal\" } else={ /ip dhcp-server network set \$id dhcp-option=(\$cur,\"lokalfi-captive-portal\") } } }"
+}
+
+# Without this, every phone arrives as the router and the API cannot tell who already has a voucher.
+ensure_preserve_hotspot_client_ip() {
+  local addr_esc
+  addr_esc="$(ros_escape "$NUC_LAN_IP")"
+  run_ros ":if ([:len [/ip firewall nat find where comment=\"preserve hotspot client IP to NUC\"]] = 0) do={ :local masq [/ip firewall nat find where comment=\"masquerade hotspot network\"]; :if ([:len \$masq] > 0) do={ /ip firewall nat add action=accept chain=srcnat comment=\"preserve hotspot client IP to NUC\" dst-address=\"${addr_esc}\" dst-port=443 protocol=tcp place-before=[:pick \$masq 0] src-address=\"10.0.0.0/24\" } else={ /ip firewall nat add action=accept chain=srcnat comment=\"preserve hotspot client IP to NUC\" dst-address=\"${addr_esc}\" dst-port=443 protocol=tcp place-before=0 src-address=\"10.0.0.0/24\" } }"
+}
+
+ensure_preserve_hotspot_client_ip
+ensure_captive_portal_dhcp
+
 if [ "$DRY_RUN" = true ]; then
   printf "%s\n" "${BLUE}[INFO] Dry run complete.${NC}"
   exit 0
@@ -130,7 +158,15 @@ printf "%s\n" "${BLUE}[INFO] Current walled-garden (hostname):${NC}"
 _run_ssh '/ip hotspot walled-garden print where disabled=no'
 printf "%s\n" "${BLUE}[INFO] Current walled-garden ip:${NC}"
 _run_ssh '/ip hotspot walled-garden ip print'
-refresh_hotspot_portal_dns
-verify_hotspot_portal_dns
+printf "%s\n" "${BLUE}[INFO] Captive portal DHCP option and client-IP NAT:${NC}"
+_run_ssh '/ip dhcp-server option print where name=lokalfi-captive-portal'
+_run_ssh '/ip dhcp-server network print where address=10.0.0.0/24'
+_run_ssh '/ip firewall nat print where comment="preserve hotspot client IP to NUC"'
+if [ "$KEEP_HOTSPOT_PROFILE" = true ]; then
+  printf "%s\n" "${BLUE}[INFO] Leaving hsprof1 and hotspot1 unchanged (--keep-hotspot-profile).${NC}"
+else
+  refresh_hotspot_portal_dns
+  verify_hotspot_portal_dns
+fi
 
 printf "%s\n" "${GREEN}[SUCCESS] Portal network rules applied (existing comments left unchanged).${NC}"

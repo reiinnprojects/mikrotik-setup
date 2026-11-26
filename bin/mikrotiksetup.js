@@ -65,6 +65,17 @@ function portalRoot() {
   return p;
 }
 
+function diskFromHtmlDirectory(raw) {
+  const line = String(raw || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .find((s) => s && !s.startsWith('['));
+  let d = (line || '').replace(/^["']|["']$/g, '').replace(/^\/+|\/+$/g, '');
+  if (d === 'flash/hotspot') return 'flash';
+  const m = d.match(/^((?:disk|usb|sd)\d+(?:-part\d+)?)\/flash\/hotspot$/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
 function goldFile(model) {
   const name = model === 'E50UG' ? 'E50UG-config.backup' : 'RB750Gr3-config.backup';
   const f = path.join(GOLD_DIR, name);
@@ -254,13 +265,14 @@ function printHelp() {
 
 Usage:
   mikrotiksetup                 menu (Enter = full setup)
-  mikrotiksetup setup           full setup
+  mikrotiksetup setup           full setup (restores the 17 Sep backup)
   mikrotiksetup setup --skip-restore   skip restore; continue from device-mode
+  mikrotiksetup update          live site: upload portal files and apply network rules
   mikrotiksetup config          set path to lokalfi-captive-portal
   mikrotiksetup upload-hotspot
   mikrotiksetup wan
   mikrotiksetup device-mode
-  mikrotiksetup apply-portal-network
+  mikrotiksetup apply-portal-network [--keep-hotspot-profile]
   mikrotiksetup refresh-portal-dns
   mikrotiksetup pull-backup
   mikrotiksetup restore
@@ -271,6 +283,9 @@ A new router is often 192.168.88.1. This PC must already be on that subnet, or y
 After restore: 192.168.10.1 on ether2-LAN, admin / lokalfi.net. Device-mode still needs a short reset tap on the box.
 
 Restore loads the 17 Sep 2026 backup for this model (July voucher set, not a blank router).
+update does not restore, format, or change hotspot users, user profiles, or hsprof1.
+It uploads into the html-directory already set on hsprof1, then applies DNS, walled garden,
+DHCP option 114, and the port-443 client-IP NAT rule.
 Lab serial ${LAB_SERIAL} is blocked unless --force.
 scripts/ talks to the router. The portal checkout supplies hotspot HTML, docker/.env, and Mongo.
 `);
@@ -483,6 +498,47 @@ async function cmdSetup(rl, { forceRestore = false, skipRestore = false } = {}) 
   ok(`Done. ${afterModel} html on the router. Guest portal: http://lokalfi.net/login.html`);
 }
 
+async function cmdUpdate(rl) {
+  const root = portalRoot();
+  const sess = await probeSession(rl);
+  requireModel(sess);
+  const dirOut = sshOk(
+    sess.host,
+    sess.user,
+    sess.password,
+    '/ip hotspot profile get [find name="hsprof1"] html-directory'
+  );
+  if (!dirOut) {
+    err('Could not read hsprof1 html-directory. Stopping without changes to the hotspot profile.');
+    process.exit(1);
+  }
+  const htmlDir = String(dirOut)
+    .split('\n')
+    .map((s) => s.trim())
+    .find((s) => s && !s.startsWith('['));
+  const disk = diskFromHtmlDirectory(htmlDir);
+  if (!disk) {
+    err(
+      `hsprof1 html-directory is "${htmlDir || ''}". Update only uploads into flash/hotspot or <volume>/flash/hotspot, and it does not change the profile.`
+    );
+    process.exit(1);
+  }
+  info(`Keeping hotspot users and hsprof1. Uploading into ${htmlDir}.`);
+  closeReadline(rl);
+  const env = mikrotikEnv(sess, {
+    MIKROTIK_KEEP_HTML_DIRECTORY: 'true',
+    NUC_LAN_IP: nucLanIp(root),
+  });
+  if (!uploadHotspot(sess.host, env, disk)) {
+    process.exit(1);
+  }
+  if (runTool(TOOL_SCRIPTS.portalNetwork, ['--keep-hotspot-profile', sess.host], env) !== 0) {
+    err('Portal network failed. Hotspot users and hsprof1 were not changed. Retry: mikrotiksetup apply-portal-network --keep-hotspot-profile');
+    process.exit(1);
+  }
+  ok('Update finished. Hotspot users, user profiles, and hsprof1 were left unchanged.');
+}
+
 async function cmdRestore(rl, force) {
   const sess = await probeSession(rl);
   const model = requireModel(sess);
@@ -507,7 +563,7 @@ function wrap(rl, scriptFile, extra = [], extraEnv = {}) {
   const host = hit ? hit.host : String(preferred).trim() || GOLD_LAN;
   if (host === HOTSPOT_GW) warn(`${GOLD_LAN} unreachable — using hotspot gateway ${HOTSPOT_GW}.`);
   process.exit(
-    runTool(scriptFile, extra.length ? extra : [host], {
+    runTool(scriptFile, [...extra, host], {
       MIKROTIK_HOST: host,
       MIKROTIK_USER: user,
       MIKROTIK_PASSWORD: pass,
@@ -520,41 +576,45 @@ async function menu(rl) {
   console.log('');
   info('What do you want to run?');
   console.log('  1) Full setup');
-  console.log('  2) Upload hotspot files');
-  console.log('  3) Fix WAN / internet');
-  console.log('  4) Enable hotspot device-mode');
-  console.log('  5) Point the hotspot at the app');
-  console.log('  6) Save a backup from this router');
-  console.log('  7) Restore the 17 Sep backup');
-  console.log('  8) Format SD card (RB750)');
-  console.log('  9) Copy router accounts into the app');
+  console.log('  2) Update a live site (keep hotspot users and profile)');
+  console.log('  3) Upload hotspot files');
+  console.log('  4) Fix WAN / internet');
+  console.log('  5) Enable hotspot device-mode');
+  console.log('  6) Point the hotspot at the app');
+  console.log('  7) Save a backup from this router');
+  console.log('  8) Restore the 17 Sep backup');
+  console.log('  9) Format SD card (RB750)');
+  console.log('  10) Copy router login into the app');
   const choice = await prompt(rl, 'Choice', '1');
   switch (choice) {
     case '1':
       await cmdSetup(rl, { forceRestore: false });
       break;
     case '2':
-      wrap(rl, TOOL_SCRIPTS.upload);
+      await cmdUpdate(rl);
       break;
     case '3':
-      wrap(rl, TOOL_SCRIPTS.wan);
+      wrap(rl, TOOL_SCRIPTS.upload);
       break;
     case '4':
-      wrap(rl, TOOL_SCRIPTS.deviceMode);
+      wrap(rl, TOOL_SCRIPTS.wan);
       break;
     case '5':
-      wrap(rl, TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      wrap(rl, TOOL_SCRIPTS.deviceMode);
       break;
     case '6':
-      wrap(rl, TOOL_SCRIPTS.pull);
+      wrap(rl, TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
       break;
     case '7':
-      await cmdRestore(rl, false);
+      wrap(rl, TOOL_SCRIPTS.pull);
       break;
     case '8':
-      await cmdFormat(rl);
+      await cmdRestore(rl, false);
       break;
     case '9':
+      await cmdFormat(rl);
+      break;
+    case '10':
       closeReadline(rl);
       process.exit(runBootstrap(portalRoot()));
       break;
@@ -575,7 +635,8 @@ async function main() {
   const raw = process.argv.slice(2);
   const force = raw.includes('--force');
   const skipRestore = raw.includes('--skip-restore');
-  const argv = raw.filter((a) => a !== '--force' && a !== '--skip-restore');
+  const keepProfile = raw.includes('--keep-hotspot-profile');
+  const argv = raw.filter((a) => a !== '--force' && a !== '--skip-restore' && a !== '--keep-hotspot-profile');
   const first = argv[0];
 
   if (first === '--help' || first === '-h' || first === 'help') {
@@ -595,6 +656,10 @@ async function main() {
     }
     if (first === 'setup' || first === 'everything') {
       await cmdSetup(rl, { forceRestore: force, skipRestore });
+      return;
+    }
+    if (first === 'update') {
+      await cmdUpdate(rl);
       return;
     }
     if (first === 'restore') {
@@ -622,7 +687,8 @@ async function main() {
       return;
     }
     if (first === 'apply-portal-network') {
-      wrap(rl, TOOL_SCRIPTS.portalNetwork, [], { NUC_LAN_IP: nucLanIp(portalRoot()) });
+      const flags = keepProfile ? ['--keep-hotspot-profile'] : [];
+      wrap(rl, TOOL_SCRIPTS.portalNetwork, flags, { NUC_LAN_IP: nucLanIp(portalRoot()) });
       return;
     }
     if (first === 'refresh-portal-dns') {

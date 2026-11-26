@@ -18,6 +18,7 @@
 #   MIKROTIK_UPLOAD_NO_MUX    Set to "true" to disable SSH multiplexing (per-file mode uses mux by default).
 #   MIKROTIK_UPLOAD_PROGRESS_MULTILINE  Set to "true" for one log line per file (default: one updating bar when stdout is a TTY).
 #   MIKROTIK_UPLOAD_PROGRESS_ASCII  Set to "true" for =/- progress bar instead of Unicode █░ (UTF-8 default).
+#   MIKROTIK_KEEP_HTML_DIRECTORY  Set to "true" to upload files and leave hsprof1 html-directory unchanged.
 #   MIKROTIK_ROUTER_FILES_DISK Force upload disk root: flash (internal) or removable volume (disk1, usb1, sd2-part1, …).
 #                      When unset, the script probes the router: no removable media → flash/hotspot/;
 #                      SD/USB present → interactive choice (TTY) or flash when non-interactive.
@@ -820,13 +821,17 @@ fi
 
 printf "%s\n" "${GREEN}[SUCCESS] Upload finished. Verify in Winbox/WebFig under Files → ${REMOTE_HOTSPOT_PATH}/${NC}"
 
-HS_DIR="${REMOTE_HOTSPOT_PATH}"
-HS_DIR_ESC="${HS_DIR//\\/\\\\}"
-HS_DIR_ESC="${HS_DIR_ESC//\"/\\\"}"
-printf "%s\n" "${BLUE}[INFO] Setting hsprof1 html-directory=${HS_DIR} ...${NC}"
-if _run_ssh "/ip hotspot profile set [find name=\"hsprof1\"] html-directory=\"${HS_DIR_ESC}\""; then
-  printf "%s\n" "${GREEN}[SUCCESS] hsprof1 html-directory=${HS_DIR}${NC}"
+if [ "${MIKROTIK_KEEP_HTML_DIRECTORY:-}" = "true" ]; then
+  printf "%s\n" "${BLUE}[INFO] Leaving hsprof1 html-directory unchanged. Files are in ${REMOTE_HOTSPOT_PATH}/.${NC}"
 else
-  printf "%s\n" "${YELLOW}[WARNING] Could not set hsprof1 html-directory. Set it to ${HS_DIR} on the hotspot profile.${NC}"
+  HS_DIR="${REMOTE_HOTSPOT_PATH}"
+  HS_DIR_ESC="${HS_DIR//\\/\\\\}"
+  HS_DIR_ESC="${HS_DIR_ESC//\"/\\\"}"
+  printf "%s\n" "${BLUE}[INFO] Setting hsprof1 html-directory=${HS_DIR} ...${NC}"
+  if _run_ssh "/ip hotspot profile set [find name=\"hsprof1\"] html-directory=\"${HS_DIR_ESC}\""; then
+    printf "%s\n" "${GREEN}[SUCCESS] hsprof1 html-directory=${HS_DIR}${NC}"
+  else
+    printf "%s\n" "${YELLOW}[WARNING] Could not set hsprof1 html-directory. Set it to ${HS_DIR} on the hotspot profile.${NC}"
+  fi
 fi
 printf "%s\n" "${BLUE}[INFO] If pages look cached, restart the hotspot service or bump asset versions as needed.${NC}"
